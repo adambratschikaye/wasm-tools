@@ -389,7 +389,6 @@ impl Module {
             self.arbitrary_imports(u)?;
         }
 
-        self.should_encode_types = !self.types.is_empty() || u.arbitrary()?;
         self.should_encode_imports = !self.imports.is_empty() || u.arbitrary()?;
 
         self.arbitrary_tags(u)?;
@@ -400,6 +399,7 @@ impl Module {
         if !self.required_exports()? {
             self.arbitrary_exports(u)?;
         };
+        self.should_encode_types = !self.types.is_empty() || u.arbitrary()?;
         self.arbitrary_start(u)?;
         self.arbitrary_elems(u)?;
         self.arbitrary_data(u)?;
@@ -1631,17 +1631,13 @@ impl Module {
         }
 
         // Add any function types that are needed and save their index.
-        let mut next_type_index = self.types.len();
         for (needed_ty, needed_index) in available_types.iter_mut() {
-            if needed_index.is_none() {
-                self.types.push(SubType {
-                    is_final: true,
-                    supertype: None,
-                    composite_type: CompositeType::Func(needed_ty.clone()),
-                })
-            }
-            *needed_index = Some(next_type_index as u32);
-            next_type_index += 1;
+            self.rec_groups.push(self.types.len()..self.types.len() + 1);
+            *needed_index = Some(self.add_type(SubType {
+                is_final: true,
+                supertype: None,
+                composite_type: CompositeType::Func(needed_ty.clone()),
+            }));
         }
 
         // Add functions that are needed.
