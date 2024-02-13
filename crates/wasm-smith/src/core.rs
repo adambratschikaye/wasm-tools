@@ -397,7 +397,9 @@ impl Module {
         self.arbitrary_tables(u)?;
         self.arbitrary_memories(u)?;
         self.arbitrary_globals(u)?;
-        self.arbitrary_exports(u)?;
+        if !self.required_exports()? {
+            self.arbitrary_exports(u)?;
+        };
         self.arbitrary_start(u)?;
         self.arbitrary_elems(u)?;
         self.arbitrary_data(u)?;
@@ -1517,6 +1519,149 @@ impl Module {
             self.defined_globals.push((global_idx, expr));
             Ok(true)
         })
+    }
+
+    fn required_exports(&mut self) -> Result<bool> {
+        let example_module = if let Some(wasm) = self.config.exports.take() {
+            wasm
+        } else {
+            return Ok(false);
+        };
+
+        #[cfg(feature = "wasmparser")]
+        {
+            self._required_exports(&example_module)?;
+            Ok(true)
+        }
+        #[cfg(not(feature = "wasmparser"))]
+        {
+            let _ = (example_module, u);
+            panic!("support for `exports` was disabled at compile time");
+        }
+    }
+
+    #[cfg(feature = "wasmparser")]
+    fn _required_exports(&mut self, example_module: &[u8]) -> Result<()> {
+        fn convert_heap_type(ty: &wasmparser::HeapType) -> HeapType {
+            match ty {
+                wasmparser::HeapType::Concrete(_) => {
+                    // TODOABK: Handle this case.
+                    panic!("Unable to handle concrete types in exports")
+                }
+                wasmparser::HeapType::Func => HeapType::Func,
+                wasmparser::HeapType::Extern => HeapType::Extern,
+                wasmparser::HeapType::Any => HeapType::Any,
+                wasmparser::HeapType::None => HeapType::None,
+                wasmparser::HeapType::NoExtern => HeapType::NoExtern,
+                wasmparser::HeapType::NoFunc => HeapType::NoFunc,
+                wasmparser::HeapType::Eq => HeapType::Eq,
+                wasmparser::HeapType::Struct => HeapType::Struct,
+                wasmparser::HeapType::Array => HeapType::Array,
+                wasmparser::HeapType::I31 => HeapType::I31,
+                wasmparser::HeapType::Exn => HeapType::Exn,
+            }
+        }
+
+        fn convert_val_type(ty: &wasmparser::ValType) -> ValType {
+            match ty {
+                wasmparser::ValType::I32 => ValType::I32,
+                wasmparser::ValType::I64 => ValType::I64,
+                wasmparser::ValType::F32 => ValType::F32,
+                wasmparser::ValType::F64 => ValType::F64,
+                wasmparser::ValType::V128 => ValType::V128,
+                wasmparser::ValType::Ref(r) => ValType::Ref(RefType {
+                    nullable: r.is_nullable(),
+                    heap_type: convert_heap_type(&r.heap_type()),
+                }),
+            }
+        }
+
+        fn convert_export_kind(kind: &wasmparser::ExternalKind) -> ExportKind {
+            match kind {
+                wasmparser::ExternalKind::Func => ExportKind::Func,
+                wasmparser::ExternalKind::Table => ExportKind::Table,
+                wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                wasmparser::ExternalKind::Global => ExportKind::Global,
+                wasmparser::ExternalKind::Tag => ExportKind::Tag,
+            }
+        }
+
+        let mut available_types = Vec::new();
+        let mut required_exports = Vec::<wasmparser::Export>::new();
+        let mut funcs: Vec<u32> = vec![];
+        for payload in wasmparser::Parser::new(0).parse_all(&example_module) {
+            match payload.expect("could not parse the export payload") {
+                wasmparser::Payload::TypeSection(type_reader) => {
+                    for ty in type_reader.into_iter_err_on_gc_types() {
+                        let ty = ty.expect("could not parse type section");
+                        available_types.push((
+                            Rc::new(FuncType {
+                                params: ty.params().into_iter().map(convert_val_type).collect(),
+                                results: ty.results().into_iter().map(convert_val_type).collect(),
+                            }),
+                            None,
+                        ));
+                    }
+                }
+                wasmparser::Payload::FunctionSection(func_reader) => {
+                    funcs = func_reader
+                        .into_iter()
+                        .collect::<Result<_, _>>()
+                        .expect("Failed to read exports");
+                }
+                wasmparser::Payload::ExportSection(export_reader) => {
+                    for export in export_reader {
+                        let export = export.expect("could not read export");
+                        required_exports.push(export);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Update the type indices for any function types that already exist.
+        for (index, subtype) in self.types.iter().enumerate() {
+            if let CompositeType::Func(func_type) = &subtype.composite_type {
+                for (needed_ty, needed_index) in available_types.iter_mut() {
+                    if needed_ty == func_type {
+                        *needed_index = Some(index as u32);
+                    }
+                }
+            }
+        }
+
+        // Add any function types that are needed and save their index.
+        let mut next_type_index = self.types.len();
+        for (needed_ty, needed_index) in available_types.iter_mut() {
+            if needed_index.is_none() {
+                self.types.push(SubType {
+                    is_final: true,
+                    supertype: None,
+                    composite_type: CompositeType::Func(needed_ty.clone()),
+                })
+            }
+            *needed_index = Some(next_type_index as u32);
+            next_type_index += 1;
+        }
+
+        // Add functions that are needed.
+        for ty_index in funcs.iter() {
+            let new_ty_index = available_types[*ty_index as usize].1.unwrap();
+            self.funcs
+                .push((new_ty_index, self.func_type(new_ty_index).clone()));
+            self.num_defined_funcs += 1;
+        }
+
+        // Add exports that are needed.
+        // TODOABK: Include what is needed for other export kinds.
+        for wasmparser::Export { name, kind, index } in required_exports {
+            let index_from_end = funcs.len() as u32 - index;
+            let new_index = self.funcs.len() as u32 - index_from_end;
+            self.exports
+                .push((name.to_string(), convert_export_kind(&kind), new_index));
+        }
+
+        Ok(())
     }
 
     fn arbitrary_exports(&mut self, u: &mut Unstructured) -> Result<()> {

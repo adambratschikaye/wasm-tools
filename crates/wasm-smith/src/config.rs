@@ -49,6 +49,9 @@ macro_rules! define_config {
             /// ```
             pub available_imports: Option<Vec<u8>>,
 
+            /// TODOABK: doc
+            pub exports: Option<Vec<u8>>,
+
             $(
                 $(#[$field_attr])*
                 pub $field: $field_ty,
@@ -59,6 +62,7 @@ macro_rules! define_config {
             fn default() -> Config {
                 Config {
                     available_imports: None,
+                    exports: None,
 
                     $(
                         $field: $default,
@@ -88,6 +92,10 @@ macro_rules! define_config {
             #[cfg_attr(feature = "clap", clap(long))]
             available_imports: Option<std::path::PathBuf>,
 
+            /// TODOABK: docs
+            #[cfg_attr(feature = "clap", clap(long))]
+            exports: Option<std::path::PathBuf>,
+
             $(
                 $(#[$field_attr])*
                 #[cfg_attr(feature = "clap", clap(long))]
@@ -100,6 +108,7 @@ macro_rules! define_config {
             pub fn or(self, other: Self) -> Self {
                 Self {
                     available_imports: self.available_imports.or(other.available_imports),
+                    exports: self.exports.or(other.exports),
 
                     $(
                         $field: self.$field.or(other.$field),
@@ -116,6 +125,13 @@ macro_rules! define_config {
                 Ok(Config {
                     available_imports: if let Some(file) = config
                         .available_imports
+                        .as_ref() {
+                            Some(wat::parse_file(file)?)
+                        } else {
+                            None
+                        },
+                    exports: if let Some(file) = config
+                        .exports
                         .as_ref() {
                             Some(wat::parse_file(file)?)
                         } else {
@@ -623,6 +639,7 @@ impl<'a> Arbitrary<'a> for Config {
             max_type_size: 1000,
             canonicalize_nans: false,
             available_imports: None,
+            exports: None,
             threads_enabled: false,
             export_everything: false,
             disallow_traps: false,
