@@ -1522,7 +1522,7 @@ impl Module {
     }
 
     fn required_exports(&mut self) -> Result<bool> {
-        let example_module = if let Some(wasm) = self.config.exports.take() {
+        let example_module = if let Some(wasm) = self.config.exports.clone() {
             wasm
         } else {
             return Ok(false);
@@ -1655,6 +1655,7 @@ impl Module {
             let new_index = self.funcs.len() as u32 - index_from_end;
             self.exports
                 .push((name.to_string(), convert_export_kind(&kind), new_index));
+            self.export_names.insert(name.to_string());
         }
 
         Ok(())
