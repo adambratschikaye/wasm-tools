@@ -396,7 +396,7 @@ impl Module {
         self.arbitrary_tables(u)?;
         self.arbitrary_memories(u)?;
         self.arbitrary_globals(u)?;
-        if !self.required_exports()? {
+        if !self.required_exports(u)? {
             self.arbitrary_exports(u)?;
         };
         self.should_encode_types = !self.types.is_empty() || u.arbitrary()?;
@@ -1472,6 +1472,53 @@ impl Module {
         )
     }
 
+    /// Add a new global of the given type and return its global index.
+    /// `choices` can be reused in a loop to avoid allocating a new `Vec` each
+    /// time.
+    fn add_arbitrary_global_of_type(
+        &mut self,
+        ty: GlobalType,
+        num_imported_globals: usize,
+        u: &mut Unstructured,
+        choices: &mut Vec<Box<dyn Fn(&mut Unstructured, ValType) -> Result<GlobalInitExpr>>>,
+    ) -> Result<u32> {
+        choices.clear();
+        let num_funcs = self.funcs.len() as u32;
+        choices.push(Box::new(move |u, ty| {
+            Ok(GlobalInitExpr::ConstExpr(match ty {
+                ValType::I32 => ConstExpr::i32_const(u.arbitrary()?),
+                ValType::I64 => ConstExpr::i64_const(u.arbitrary()?),
+                ValType::F32 => ConstExpr::f32_const(u.arbitrary()?),
+                ValType::F64 => ConstExpr::f64_const(u.arbitrary()?),
+                ValType::V128 => ConstExpr::v128_const(u.arbitrary()?),
+                ValType::Ref(ty) => {
+                    assert!(ty.nullable);
+                    if ty.heap_type == HeapType::Func && num_funcs > 0 && u.arbitrary()? {
+                        let func = u.int_in_range(0..=num_funcs - 1)?;
+                        return Ok(GlobalInitExpr::FuncRef(func));
+                    }
+                    ConstExpr::ref_null(ty.heap_type)
+                }
+            }))
+        }));
+
+        for (i, g) in self.globals[..num_imported_globals].iter().enumerate() {
+            if !g.mutable && g.val_type == ty.val_type {
+                choices.push(Box::new(move |_, _| {
+                    Ok(GlobalInitExpr::ConstExpr(ConstExpr::global_get(i as u32)))
+                }));
+            }
+        }
+
+        let f = u.choose(&choices)?;
+        let expr = f(u, ty.val_type)?;
+        let global_idx = self.globals.len() as u32;
+        self.globals.push(ty);
+        self.defined_globals.push((global_idx, expr));
+
+        Ok(global_idx)
+    }
+
     fn arbitrary_globals(&mut self, u: &mut Unstructured) -> Result<()> {
         let mut choices: Vec<Box<dyn Fn(&mut Unstructured, ValType) -> Result<GlobalInitExpr>>> =
             vec![];
@@ -1483,45 +1530,13 @@ impl Module {
             }
 
             let ty = self.arbitrary_global_type(u)?;
+            self.add_arbitrary_global_of_type(ty, num_imported_globals, u, &mut choices)?;
 
-            choices.clear();
-            let num_funcs = self.funcs.len() as u32;
-            choices.push(Box::new(move |u, ty| {
-                Ok(GlobalInitExpr::ConstExpr(match ty {
-                    ValType::I32 => ConstExpr::i32_const(u.arbitrary()?),
-                    ValType::I64 => ConstExpr::i64_const(u.arbitrary()?),
-                    ValType::F32 => ConstExpr::f32_const(u.arbitrary()?),
-                    ValType::F64 => ConstExpr::f64_const(u.arbitrary()?),
-                    ValType::V128 => ConstExpr::v128_const(u.arbitrary()?),
-                    ValType::Ref(ty) => {
-                        assert!(ty.nullable);
-                        if ty.heap_type == HeapType::Func && num_funcs > 0 && u.arbitrary()? {
-                            let func = u.int_in_range(0..=num_funcs - 1)?;
-                            return Ok(GlobalInitExpr::FuncRef(func));
-                        }
-                        ConstExpr::ref_null(ty.heap_type)
-                    }
-                }))
-            }));
-
-            for (i, g) in self.globals[..num_imported_globals].iter().enumerate() {
-                if !g.mutable && g.val_type == ty.val_type {
-                    choices.push(Box::new(move |_, _| {
-                        Ok(GlobalInitExpr::ConstExpr(ConstExpr::global_get(i as u32)))
-                    }));
-                }
-            }
-
-            let f = u.choose(&choices)?;
-            let expr = f(u, ty.val_type)?;
-            let global_idx = self.globals.len() as u32;
-            self.globals.push(ty);
-            self.defined_globals.push((global_idx, expr));
             Ok(true)
         })
     }
 
-    fn required_exports(&mut self) -> Result<bool> {
+    fn required_exports(&mut self, u: &mut Unstructured) -> Result<bool> {
         let example_module = if let Some(wasm) = self.config.exports.clone() {
             wasm
         } else {
@@ -1530,7 +1545,7 @@ impl Module {
 
         #[cfg(feature = "wasmparser")]
         {
-            self._required_exports(&example_module)?;
+            self._required_exports(u, &example_module)?;
             Ok(true)
         }
         #[cfg(not(feature = "wasmparser"))]
@@ -1541,7 +1556,7 @@ impl Module {
     }
 
     #[cfg(feature = "wasmparser")]
-    fn _required_exports(&mut self, example_module: &[u8]) -> Result<()> {
+    fn _required_exports(&mut self, u: &mut Unstructured, example_module: &[u8]) -> Result<()> {
         fn convert_heap_type(ty: &wasmparser::HeapType) -> HeapType {
             match ty {
                 wasmparser::HeapType::Concrete(_) => {
@@ -1586,9 +1601,13 @@ impl Module {
             }
         }
 
-        let mut available_types = Vec::new();
-        let mut required_exports = Vec::<wasmparser::Export>::new();
+        // Map from function type index in `exports` to type and index in generated module.
+        let mut available_types: Vec<(Rc<FuncType>, Option<u32>)> = vec![];
+        // Map from global index in `exports` to type and index in generated module.
+        let mut globals: Vec<(GlobalType, Option<u32>)> = vec![];
+        let mut required_exports: Vec<wasmparser::Export> = vec![];
         let mut funcs: Vec<u32> = vec![];
+        // TODOABK: What if there are imports?
         for payload in wasmparser::Parser::new(0).parse_all(&example_module) {
             match payload.expect("could not parse the export payload") {
                 wasmparser::Payload::TypeSection(type_reader) => {
@@ -1607,12 +1626,24 @@ impl Module {
                     funcs = func_reader
                         .into_iter()
                         .collect::<Result<_, _>>()
-                        .expect("Failed to read exports");
+                        .expect("Failed to read `exports` function section");
                 }
                 wasmparser::Payload::ExportSection(export_reader) => {
-                    for export in export_reader {
-                        let export = export.expect("could not read export");
-                        required_exports.push(export);
+                    required_exports = export_reader
+                        .into_iter()
+                        .collect::<Result<_, _>>()
+                        .expect("Failed to read `exports` export section");
+                }
+                wasmparser::Payload::GlobalSection(global_reader) => {
+                    for global in global_reader {
+                        let global = global.expect("Failed to read `exports` global section");
+                        globals.push((
+                            GlobalType {
+                                mutable: global.ty.mutable,
+                                val_type: convert_val_type(&global.ty.content_type),
+                            },
+                            None,
+                        ))
                     }
                 }
                 _ => {}
@@ -1648,13 +1679,34 @@ impl Module {
             self.num_defined_funcs += 1;
         }
 
+        // Add any globals that are needed.
+        let mut choices = vec![];
+        let num_imported_globals = self.globals.len() - self.defined_globals.len();
+        for (global_ty, index) in globals.iter_mut() {
+            *index = Some(self.add_arbitrary_global_of_type(
+                *global_ty,
+                num_imported_globals,
+                u,
+                &mut choices,
+            )?);
+        }
+
         // Add exports that are needed.
         // TODOABK: Include what is needed for other export kinds.
         for wasmparser::Export { name, kind, index } in required_exports {
-            let index_from_end = funcs.len() as u32 - index;
-            let new_index = self.funcs.len() as u32 - index_from_end;
-            self.exports
-                .push((name.to_string(), convert_export_kind(&kind), new_index));
+            let kind = convert_export_kind(&kind);
+            let new_index = match kind {
+                ExportKind::Func => {
+                    let index_from_end = funcs.len() as u32 - index;
+                    self.funcs.len() as u32 - index_from_end
+                }
+                ExportKind::Global => globals[index as usize].1.unwrap(),
+                ExportKind::Table | ExportKind::Memory | ExportKind::Tag => panic!(
+                    "Config `exports` has an export of type {:?} which cannot yet be handled.",
+                    kind
+                ),
+            };
+            self.exports.push((name.to_string(), kind, new_index));
             self.export_names.insert(name.to_string());
         }
 

@@ -1,31 +1,87 @@
 use arbitrary::{Arbitrary, Unstructured};
 use rand::{rngs::SmallRng, RngCore, SeedableRng};
 use wasm_smith::{Config, Module};
-use wasmparser::{ExternalKind, FuncType, Parser, TypeRef, ValType, Validator};
+use wasmparser::{ExternalKind, FuncType, GlobalType, Parser, TypeRef, ValType, Validator};
 
 mod common;
 use common::{parser_features_from_config, validate};
 
+#[derive(Debug)]
+enum ExportType {
+    Func(FuncType),
+    Global(GlobalType),
+}
+
 struct TestCase {
-    export_module: String,
-    expected_exports: Vec<(String, FuncType)>,
+    export_module: &'static str,
+    expected_exports: Vec<(&'static str, ExportType)>,
 }
 
 fn test_cases() -> Vec<TestCase> {
-    vec![TestCase {
-        export_module: r#"
+    vec![
+        TestCase {
+            export_module: r#"
 		(module
 			(func (export "foo") (param i32) (result i64)
 				unreachable
 			)
 		)
-		"#
-        .to_string(),
-        expected_exports: vec![(
-            "foo".to_string(),
-            FuncType::new([ValType::I32], [ValType::I64]),
-        )],
-    }]
+		"#,
+            expected_exports: vec![(
+                "foo",
+                ExportType::Func(FuncType::new([ValType::I32], [ValType::I64])),
+            )],
+        },
+        TestCase {
+            export_module: r#"
+		(module
+			(func (export "a") (param i32) (result i64)
+				unreachable
+			)
+			(func (export "b")
+				unreachable
+			)
+			(func (export "c")
+				unreachable
+			)
+		)
+		"#,
+            expected_exports: vec![
+                (
+                    "a",
+                    ExportType::Func(FuncType::new([ValType::I32], [ValType::I64])),
+                ),
+                ("b", ExportType::Func(FuncType::new([], []))),
+                ("c", ExportType::Func(FuncType::new([], []))),
+            ],
+        },
+        TestCase {
+            export_module: r#"
+		(module
+			(func (export "a") (param i32 i32 f32 f64) (result f32)
+				unreachable
+			)
+            (global (export "glob") f64)
+		)
+		"#,
+            expected_exports: vec![
+                (
+                    "a",
+                    ExportType::Func(FuncType::new(
+                        [ValType::I32, ValType::I32, ValType::F32, ValType::F64],
+                        [ValType::F32],
+                    )),
+                ),
+                (
+                    "glob",
+                    ExportType::Global(GlobalType {
+                        content_type: ValType::F64,
+                        mutable: false,
+                    }),
+                ),
+            ],
+        },
+    ]
 }
 
 #[test]
@@ -50,7 +106,9 @@ fn smoke_test_exports_config() {
 
             let mut types = vec![];
             let mut func_imports = vec![];
+            let mut global_imports = vec![];
             let mut funcs = vec![];
+            let mut globals = vec![];
             let mut exports = vec![];
 
             for payload in Parser::new(0).parse_all(&wasm_bytes) {
@@ -64,34 +122,56 @@ fn smoke_test_exports_config() {
                 } else if let wasmparser::Payload::FunctionSection(rdr) = payload {
                     funcs = rdr.into_iter().collect::<Result<_, _>>().unwrap();
                 } else if let wasmparser::Payload::ImportSection(rdr) = payload {
-                    func_imports = rdr
-                        .into_iter()
-                        .filter_map(|imp| {
-                            let imp = imp.unwrap();
-                            if let TypeRef::Func(i) = imp.ty {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    for import in rdr {
+                        let import = import.expect("Failed to read import");
+                        match import.ty {
+                            TypeRef::Func(i) => func_imports.push(i),
+                            TypeRef::Global(g) => global_imports.push(g),
+                            TypeRef::Table(_) | TypeRef::Memory(_) | TypeRef::Tag(_) => {}
+                        }
+                    }
+                } else if let wasmparser::Payload::GlobalSection(rdr) = payload {
+                    for global in rdr {
+                        let global = global.expect("Failed to read global");
+                        globals.push(global.ty);
+                    }
                 } else if let wasmparser::Payload::ExportSection(rdr) = payload {
                     exports = rdr.into_iter().collect::<Result<_, _>>().unwrap();
                 }
             }
 
-            assert_eq!(test_case.expected_exports.len(), exports.len());
+            assert_eq!(
+                test_case.expected_exports.len(),
+                exports.len(),
+                "Expected exports {:?} but got {:?}",
+                test_case.expected_exports,
+                exports
+            );
             for ((name, ty), export) in test_case.expected_exports.iter().zip(exports.iter()) {
-                assert_eq!(name, export.name);
-                assert_eq!(ExternalKind::Func, export.kind);
-                let index = export.index as usize;
-                let type_index = if index < func_imports.len() {
-                    func_imports[index]
-                } else {
-                    funcs[index - func_imports.len()]
-                };
-                let export_ty = &types[type_index as usize];
-                assert_eq!(ty, export_ty);
+                assert_eq!(name, &export.name);
+                match ty {
+                    ExportType::Func(func_ty) => {
+                        assert_eq!(ExternalKind::Func, export.kind);
+                        let index = export.index as usize;
+                        let type_index = if index < func_imports.len() {
+                            func_imports[index]
+                        } else {
+                            funcs[index - func_imports.len()]
+                        };
+                        let export_ty = &types[type_index as usize];
+                        assert_eq!(func_ty, export_ty);
+                    }
+                    ExportType::Global(global_ty) => {
+                        assert_eq!(ExternalKind::Global, export.kind);
+                        let index = export.index as usize;
+                        let export_ty = if index < global_imports.len() {
+                            global_imports[index]
+                        } else {
+                            globals[index - global_imports.len()]
+                        };
+                        assert_eq!(global_ty, &export_ty);
+                    }
+                }
             }
         }
     }
